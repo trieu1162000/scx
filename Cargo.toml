@@ -20,6 +20,7 @@ members = [
     "scheds/rust/scx_chaos",
     "scheds/rust/scx_cosmos",
     "scheds/rust/scx_eevdf",
+    "scheds/rust/scx_fcp",
     "scheds/rust/scx_forge",
     "scheds/rust/scx_flash",
     "scheds/rust/scx_lavd",

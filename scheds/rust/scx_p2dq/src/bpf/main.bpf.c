@@ -496,15 +496,6 @@ static __always_inline void update_task_pelt(task_ctx *taskc, u64 now, u64 delta
 	if (!p2dq_config.pelt_enabled)
 		return;
 
-	if (!taskc->pelt_last_update_time) {
-		/* First update - initialize */
-		taskc->pelt_last_update_time = now;
-		taskc->util_sum = 0;
-		taskc->util_avg = 0;
-		taskc->period_contrib = 0;
-		return;
-	}
-
 	elapsed_ns = now - taskc->pelt_last_update_time;
 
 	/**
@@ -3312,6 +3303,12 @@ static s32 p2dq_init_task_impl(struct task_struct *p, struct scx_init_task_args 
 	taskc->llc_id = cpuc->llc_id;
 	taskc->node_id = cpuc->node_id;
 	taskc->pid = p->pid;
+
+	/*
+	 * scx_task_alloc() returns zeroed arena memory. Seed only the PELT
+	 * timestamp here; the remaining PELT fields start at zero.
+	 */
+	taskc->pelt_last_update_time = bpf_ktime_get_ns();
 
 	// Adjust starting index based on niceness
 	if (p->scx.weight == 100) {

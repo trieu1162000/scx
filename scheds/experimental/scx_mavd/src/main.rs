@@ -1260,15 +1260,31 @@ impl Drop for Scheduler<'_> {
     }
 }
 
-/// The stats socket is /var/run/scx/<scheduler path>/stats and a UNIX socket
-/// path holds at most 107 bytes.
-const SUB_SCHED_PATH_MAX: usize = 107 - "/var/run/scx/".len() - "/stats".len();
+/// `sun_path` is 108 bytes including the terminating NUL.
+const UNIX_SOCKET_PATH_MAX: usize = 107;
+
+fn sched_path_fits(base_path: &Path, sched_path: &Path) -> bool {
+    base_path.join(sched_path).join("stats").as_os_str().len() <= UNIX_SOCKET_PATH_MAX
+}
+
+/// Mirror under sub/, falling back to sub/<cgid>; None if neither fits.
+fn choose_sched_path(rel: Option<&Path>, cgid: u64, base_path: &Path) -> Option<PathBuf> {
+    if let Some(rel) = rel.filter(|rel| !rel.as_os_str().is_empty()) {
+        let mirrored = Path::new("sub").join(rel);
+        if sched_path_fits(base_path, &mirrored) {
+            return Some(mirrored);
+        }
+    }
+
+    let fallback = PathBuf::from(format!("sub/{cgid}"));
+    sched_path_fits(base_path, &fallback).then_some(fallback)
+}
 
 /// Resolve the attach cgroup: its id, which is its inode number, and the
 /// scheduler path its stats server lives under. The path mirrors the cgroup's
 /// path below /sys/fs/cgroup under sub/, or is sub/<id> for a cgroup outside
 /// that mount or with a path too long for a socket. A path that is not a
-/// cgroup, or the cgroup root, is refused.
+/// cgroup, the cgroup root, or too long even for sub/<id> is refused.
 fn sub_cgroup(path: &str) -> Result<(u64, PathBuf)> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("Failed to resolve cgroup path {path}"))?;
@@ -1287,14 +1303,68 @@ fn sub_cgroup(path: &str) -> Result<(u64, PathBuf)> {
     if cgid <= 1 {
         anyhow::bail!("{} is the cgroup root", path.display());
     }
-    let mirrored = path
-        .strip_prefix("/sys/fs/cgroup")
-        .ok()
-        .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| Path::new("sub").join(rel))
-        .filter(|p| p.as_os_str().len() <= SUB_SCHED_PATH_MAX);
-    let sched_path = mirrored.unwrap_or_else(|| PathBuf::from(format!("sub/{cgid}")));
+    let base_path = scx_stats::default_base_path();
+    let Some(sched_path) =
+        choose_sched_path(path.strip_prefix("/sys/fs/cgroup").ok(), cgid, &base_path)
+    else {
+        anyhow::bail!(
+            "stats socket path for {} is too long for base {}",
+            path.display(),
+            base_path.display()
+        );
+    };
     Ok((cgid, sched_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sched_path_limit() {
+        let fits = |base: &str, len: usize| {
+            sched_path_fits(Path::new(base), &PathBuf::from("x".repeat(len)))
+        };
+        assert!(fits("/var/run/scx", 88));
+        assert!(!fits("/var/run/scx", 89));
+        assert!(fits("/var/run/scx/", 88));
+        assert!(!fits("/var/run/scx/", 89));
+        assert!(fits("/data/local/tmp/scx", 81));
+        assert!(!fits("/data/local/tmp/scx", 82));
+        assert!(fits("/", 100));
+        assert!(!fits("/", 101));
+    }
+
+    #[test]
+    fn sched_path_selection() {
+        fn choose(rel: Option<&str>, base: &str) -> Option<PathBuf> {
+            choose_sched_path(rel.map(Path::new), 42, Path::new(base))
+        }
+
+        let default_base = "/var/run/scx";
+        assert_eq!(choose(None, default_base), Some(PathBuf::from("sub/42")));
+        assert_eq!(
+            choose(Some("foo/bar"), default_base),
+            Some(PathBuf::from("sub/foo/bar"))
+        );
+
+        let android_base = "/data/local/tmp/scx";
+        let max = "x".repeat(77);
+        assert_eq!(
+            choose(Some(max.as_str()), android_base),
+            Some(Path::new("sub").join(&max))
+        );
+
+        // 78 bytes under this base makes the socket path 108 bytes.
+        let over = "x".repeat(78);
+        assert_eq!(
+            choose(Some(over.as_str()), android_base),
+            Some(PathBuf::from("sub/42"))
+        );
+
+        let too_long_base = format!("/{}", "x".repeat(120));
+        assert_eq!(choose(Some("foo"), &too_long_base), None);
+    }
 }
 
 /// Return heap freed during initialization to the OS.

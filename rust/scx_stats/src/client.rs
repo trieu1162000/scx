@@ -34,7 +34,7 @@ impl Default for StatsClient {
 impl StatsClient {
     pub fn new() -> Self {
         Self {
-            base_path: crate::default_stats_base_path(),
+            base_path: PathBuf::from("/var/run/scx"),
             sched_path: PathBuf::from("root"),
             stats_path: PathBuf::from("stats"),
             path: None,

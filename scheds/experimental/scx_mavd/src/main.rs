@@ -1216,9 +1216,38 @@ impl Drop for Scheduler<'_> {
     }
 }
 
-/// The stats socket is /var/run/scx/<scheduler path>/stats and a UNIX socket
-/// path holds at most 107 bytes.
-const SUB_SCHED_PATH_MAX: usize = 107 - "/var/run/scx/".len() - "/stats".len();
+/// A UNIX socket path holds at most 107 bytes.
+const UNIX_SOCKET_PATH_MAX: usize = 107;
+
+/// Maximum scheduler path length for the stats socket under `base_path`.
+///
+/// The full path is `<base_path>/<scheduler path>/stats`. Joining "x" and
+/// dropping its last byte gives the prefix length without assuming that the
+/// base path has no trailing separator.
+fn sched_path_max_len(base_path: &Path) -> usize {
+    let prefix_len = base_path.join("x").as_os_str().len().saturating_sub(1);
+    UNIX_SOCKET_PATH_MAX
+        .saturating_sub(prefix_len)
+        .saturating_sub("/stats".len())
+}
+
+/// Choose the scheduler path for a cgroup relative path and base path.
+///
+/// Mirrors the cgroup under `sub/` when it fits, and falls back to `sub/<cgid>`
+/// otherwise. Returns `None` when even the fallback does not fit.
+fn choose_sched_path(rel: Option<&Path>, cgid: u64, base_path: &Path) -> Option<PathBuf> {
+    let max_sched_path = sched_path_max_len(base_path);
+    let mirrored = rel
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(|rel| Path::new("sub").join(rel))
+        .filter(|p| p.as_os_str().len() <= max_sched_path);
+    let sched_path = mirrored.unwrap_or_else(|| PathBuf::from(format!("sub/{cgid}")));
+    if sched_path.as_os_str().len() <= max_sched_path {
+        Some(sched_path)
+    } else {
+        None
+    }
+}
 
 /// Resolve the attach cgroup: its id, which is its inode number, and the
 /// scheduler path its stats server lives under. The path mirrors the cgroup's
@@ -1243,14 +1272,52 @@ fn sub_cgroup(path: &str) -> Result<(u64, PathBuf)> {
     if cgid <= 1 {
         anyhow::bail!("{} is the cgroup root", path.display());
     }
-    let mirrored = path
-        .strip_prefix("/sys/fs/cgroup")
-        .ok()
-        .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| Path::new("sub").join(rel))
-        .filter(|p| p.as_os_str().len() <= SUB_SCHED_PATH_MAX);
-    let sched_path = mirrored.unwrap_or_else(|| PathBuf::from(format!("sub/{cgid}")));
+    let base_path = scx_stats::default_base_path();
+    let Some(sched_path) =
+        choose_sched_path(path.strip_prefix("/sys/fs/cgroup").ok(), cgid, &base_path)
+    else {
+        anyhow::bail!(
+            "stats socket path for {} is too long for base {}",
+            path.display(),
+            base_path.display()
+        );
+    };
     Ok((cgid, sched_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sched_path_limit() {
+        assert_eq!(sched_path_max_len(Path::new("/var/run/scx")), 88);
+        assert_eq!(sched_path_max_len(Path::new("/var/run/scx/")), 88);
+        assert_eq!(sched_path_max_len(Path::new("/data/local/tmp/scx")), 81);
+        assert_eq!(sched_path_max_len(Path::new("/data/local/tmp/scx/")), 81);
+    }
+
+    #[test]
+    fn sched_path_selection() {
+        let default_base = Path::new("/var/run/scx");
+        assert_eq!(
+            choose_sched_path(Some(Path::new("foo/bar")), 42, default_base),
+            Some(PathBuf::from("sub/foo/bar"))
+        );
+
+        let android_base = Path::new("/data/local/tmp/scx");
+        let long_rel = PathBuf::from("x".repeat(100));
+        assert_eq!(
+            choose_sched_path(Some(long_rel.as_path()), 42, android_base),
+            Some(PathBuf::from("sub/42"))
+        );
+
+        let too_long_base = PathBuf::from(format!("/{}", "x".repeat(120)));
+        assert_eq!(
+            choose_sched_path(Some(Path::new("foo")), 42, &too_long_base),
+            None
+        );
+    }
 }
 
 /// Return heap freed during initialization to the OS.
